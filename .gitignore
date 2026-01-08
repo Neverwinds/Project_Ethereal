@@ -1,0 +1,82 @@
+### --- Project Ethereal Git Ignore --- ###
+
+# --- Python 核心 ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- 环境变量与密钥 (绝不能上传) ---
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+auth.json
+api_keys.yaml
+secrets.*
+
+# --- 配置文件 (防止覆盖本地配置) ---
+# 如果你希望保留配置模板，可以保留 config.example.yaml 但忽略 config.yaml
+config/*.yaml
+!config/.gitkeep
+
+# --- IDE 与编辑器 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# --- 操作系统临时文件 ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini
+
+# --- 运行时数据与日志 (防止污染仓库) ---
+*.log
+logs/
+temp/
+tmp/
+*.bak
+*.swp
+
+# --- 大文件与多媒体 (因为它们已经在 Repo 外，这里做二次保险) ---
+*.mp3
+*.wav
+*.mp4
+*.pth
+*.onnx
+*.gguf
+*.bin
+*.ckpt
+*.safetensors
+
+# --- 本地数据库 ---
+*.db
+*.sqlite
+*.sqlite3
+vector_db/
