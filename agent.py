@@ -1,15 +1,15 @@
 import requests
-import pygame
-import io
-import os
 import time
 import json
 from rich.panel import Panel
-import config 
+import config
+# [新增] 引入独立的语音引擎
+from tts_engine import TTSEngine
 
 class EtherealBot:
     """
     Project Ethereal 核心智能体 (Agent Core)
+    负责认知推理，并调度 TTS 引擎进行表达。
     """
     def __init__(self):
         # 0. 启动自检
@@ -26,9 +26,24 @@ class EtherealBot:
             }
         ]
 
-        # 3. 自动执行冷启动预热
+        # 3. [重构] 初始化语音引擎 (Mouth)
+        # 将配置中的 voice_settings 传给引擎
+        self.tts = TTSEngine(self.character_config.get("voice_settings", {}))
+
+        # 4. 自动执行冷启动预热 (Brain)
         self.is_cold_start = True
         self._warmup_neural_engine()
+
+    # --- 兼容性属性 ---
+    # 为了让 GUI (gui.py) 依然能通过 bot.voice_enabled 读取状态
+    @property
+    def voice_enabled(self):
+        return self.tts.enabled
+    
+    @voice_enabled.setter
+    def voice_enabled(self, value):
+        self.tts.enabled = value
+    # ------------------
 
     def _system_check(self):
         """系统环境检查"""
@@ -37,16 +52,6 @@ class EtherealBot:
         config.security_audit(config.TTS_API_URL, "Mouth (GPT-SoVITS)")
         print("[Security] 环境安全。")
         print("------------------------------------------")
-
-        print("[DEBUG] 正在初始化音频驱动...") 
-        try:
-            pygame.mixer.init()
-        except Exception as e:
-            config.console.print(f"[yellow][System] Audio device not found: {e}. Sound disabled.[/yellow]")
-
-        self.voice_enabled = False
-        print("[DEBUG] 正在检测 GPT-SoVITS 服务状态...")
-        self._check_voice_service()
 
     def _load_character_config(self):
         """加载 JSON 配置文件"""
@@ -57,42 +62,22 @@ class EtherealBot:
                 return data
         except FileNotFoundError:
             config.console.print(f"[red]❌ 找不到配置文件: {config.CHARACTER_CONFIG_PATH}[/red]")
-            # 返回默认值防止崩溃
             return {"system_prompt": "You are Ethereal."}
-
-    def _check_voice_service(self):
-        """探测 TTS 服务"""
-        try:
-            requests.get(config.TTS_API_URL, timeout=1.0)
-            
-            # 检查音频文件是否存在
-            if not os.path.exists(config.REF_AUDIO_PATH):
-                config.console.print(Panel(f"TTS 在线，但参考音频缺失:\n{config.REF_AUDIO_PATH}\n请将 wav 文件放入 assets 文件夹。", style="bold yellow"))
-                self.voice_enabled = False
-            else:
-                self.voice_enabled = True
-                config.console.print(Panel("● Brain: Linked\n● Mouth: Online", style="bold green", title="System Check"))
-
-        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
-            self.voice_enabled = False
-            config.console.print(Panel("● Brain: Linked\n○ Mouth: Offline (Text Mode)", style="bold yellow", title="System Check"))
 
     def _warmup_neural_engine(self):
         """
         主动预热：强制加载模型到显存
         """
         config.console.print("\n[bold magenta]>>> 系统正在执行冷启动 (Cold Start)...[/bold magenta]")
-        config.console.print("[dim]正在将神经网络完整加载到 RTX 5080 显存中，请稍候...[/dim]")
+        config.console.print("[dim]正在将神经网络完整加载到本地计算核心显存中，请稍候...[/dim]")
 
         with config.console.status("[bold magenta]正在唤醒神经网络...[/bold magenta]", spinner="dots"):
             try:
-                # 发送一个极简的 Dummy 请求来触发加载
                 payload = {
                     "model": config.TARGET_MODEL,
                     "messages": [{"role": "system", "content": "init"}],
                     "stream": False 
                 }
-                # 发送请求 (设置较长超时)
                 requests.post(config.OLLAMA_URL, json=payload, timeout=60)
                 
                 self.is_cold_start = False
@@ -135,45 +120,11 @@ class EtherealBot:
                 return None
 
     def speak(self, text):
-        if not self.voice_enabled or not text:
-            return
-        
-        # 从配置中读取 TTS 参数
-        voice_cfg = self.character_config.get("voice_settings", {})
-
-        with config.console.status("[bold blue]Synthesizing Voice...", spinner="bouncingBar"):
-            try:
-                # [关键修正] 适配 GPT-SoVITS API v2 的参数名称
-                # v1: text_language, prompt_language, refer_wav_path
-                # v2: text_lang, prompt_lang, ref_audio_path
-                params = {
-                    "text": text,
-                    "text_lang": voice_cfg.get("target_lang", "zh"),    # 修正
-                    "ref_audio_path": config.REF_AUDIO_PATH,            # 修正
-                    "prompt_text": voice_cfg.get("prompt_text", ""),
-                    "prompt_lang": voice_cfg.get("prompt_lang", "zh"),  # 修正
-                }
-                
-                response = requests.get(config.TTS_API_URL, params=params, timeout=30)
-
-                if response.status_code == 200:
-                    audio_stream = io.BytesIO(response.content)
-                    pygame.mixer.music.load(audio_stream)
-                    pygame.mixer.music.play()
-                    while pygame.mixer.music.get_busy():
-                        pygame.time.Clock().tick(10)
-                else:
-                    config.console.print(f"[red]TTS API Error ({response.status_code})[/red]")
-                    # 如果报错 422，通常是参数验证失败
-                    if response.status_code == 422:
-                        config.console.print(f"[dim]{response.text}[/dim]")
-
-            except Exception as e:
-                config.console.print(f"[red]Audio Error:[/red] {e}")
-                self.voice_enabled = False
+        """委托给 TTS 引擎表达"""
+        self.tts.speak(text)
 
     def terminate(self):
-        config.console.print("\n[yellow]正在切断神经连接并释放 RTX 5080 资源...[/yellow]")
+        config.console.print("\n[yellow]正在切断神经连接并释放本地计算资源...[/yellow]")
         try:
             payload = {
                 "model": config.TARGET_MODEL,
