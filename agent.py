@@ -1,41 +1,53 @@
 import requests
 import time
 import json
+import re
+import os
+from openai import OpenAI
 from rich.panel import Panel
 import config
-# [新增] 引入独立的语音引擎
 from tts_engine import TTSEngine
 
 class EtherealBot:
     """
-    Project Ethereal 核心智能体 (Agent Core)
-    负责认知推理，并调度 TTS 引擎进行表达。
+    Project Ethereal 核心智能体 (Agent Core) - V3.4 安全与调试增强版
     """
     def __init__(self):
-        # 0. 启动自检
-        self._system_check()
-
-        # 1. 加载人格配置 (从 JSON)
-        self.character_config = self._load_character_config()
+        # 1. 加载普通配置
+        self.character_config = self._load_json(config.CHARACTER_CONFIG_PATH)
+        # 2. 加载敏感配置 (API Key)
+        self.secrets_config = self._load_json(config.SECRETS_CONFIG_PATH)
         
-        # 2. 初始化记忆
-        self.history = [
-            {
-                "role": "system",
-                "content": self.character_config.get("system_prompt", "You are a helpful AI.")
-            }
-        ]
+        sys_cfg = self.character_config.get("system_settings", {})
+        self.brain_type = sys_cfg.get("brain_type", config.DEFAULT_BRAIN)
+        # [安全] 从 secrets.json 读取 Key
+        self.deepseek_key = self.secrets_config.get("deepseek_key", "")
+        self.ollama_model = sys_cfg.get("ollama_model", config.OLLAMA_MODEL)
 
-        # 3. [重构] 初始化语音引擎 (Mouth)
-        # 将配置中的 voice_settings 传给引擎
+        self._system_check()
+        
+        self.system_prompt_text = self._construct_system_prompt()
+        self.history = [] 
+        self.ds_client = None
+
+        # 初始化大脑
+        if self.brain_type == "deepseek":
+            self._init_deepseek()
+            self._unload_local_model()
+        elif self.brain_type == "ollama":
+            self.history.append({"role": "system", "content": self.system_prompt_text})
+            self.is_cold_start = True
+            self._warmup_neural_engine()
+        else:
+            self.brain_type = "ollama"
+            self.history.append({"role": "system", "content": self.system_prompt_text})
+            self.is_cold_start = True
+            self._warmup_neural_engine()
+
         self.tts = TTSEngine(self.character_config.get("voice_settings", {}))
+        self.last_stats = {"brain_time": 0.0, "mouth_time": 0.0}
+        self.current_emotion = "neutral"
 
-        # 4. 自动执行冷启动预热 (Brain)
-        self.is_cold_start = True
-        self._warmup_neural_engine()
-
-    # --- 兼容性属性 ---
-    # 为了让 GUI (gui.py) 依然能通过 bot.voice_enabled 读取状态
     @property
     def voice_enabled(self):
         return self.tts.enabled
@@ -43,94 +55,197 @@ class EtherealBot:
     @voice_enabled.setter
     def voice_enabled(self, value):
         self.tts.enabled = value
-    # ------------------
 
     def _system_check(self):
-        """系统环境检查"""
-        print("--- 执行启动前安全审计 (Security Audit) ---")
-        config.security_audit(config.OLLAMA_URL, "Brain (Ollama)")
+        print("--- 启动自检 ---")
         config.security_audit(config.TTS_API_URL, "Mouth (GPT-SoVITS)")
-        print("[Security] 环境安全。")
-        print("------------------------------------------")
+        if self.brain_type == "ollama":
+            config.security_audit(config.OLLAMA_URL, "Brain (Ollama)")
+            print(f"[System] 当前大脑: Local Ollama ({self.ollama_model})")
+        else:
+            print(f"[System] 当前大脑: Cloud {self.brain_type.title()}")
+        print("----------------")
 
-    def _load_character_config(self):
-        """加载 JSON 配置文件"""
+    def _load_json(self, path):
+        """通用 JSON 读取"""
         try:
-            with open(config.CHARACTER_CONFIG_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                config.console.print(f"[green]✔ 人格数据已加载: {data.get('name', 'Unknown')}[/green]")
-                return data
-        except FileNotFoundError:
-            config.console.print(f"[red]❌ 找不到配置文件: {config.CHARACTER_CONFIG_PATH}[/red]")
-            return {"system_prompt": "You are Ethereal."}
+            if not os.path.exists(path): return {}
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _construct_system_prompt(self):
+        cfg = self.character_config
+        persona = cfg.get("persona", {})
+        kb = cfg.get("knowledge_base", {})
+        instr = cfg.get("instructions", {})
+        
+        prompt = f"{persona.get('identity', '')}\n"
+        prompt += f"\n[PERSONALITY]\n{persona.get('personality', '')}\n"
+        
+        if kb:
+            prompt += "\n[KNOWLEDGE]\n"
+            prompt += f"- Origin: {kb.get('origin', '')}\n"
+            prompt += f"- Likes: {kb.get('likes', '')}\n"
+            prompt += f"- Dislikes: {kb.get('dislikes', '')}\n"
+            
+        prompt += f"\n[INSTRUCTIONS]\n{instr.get('format_rules', '')}\n"
+        prompt += f"\n[EXAMPLES]\n{instr.get('examples', '')}\n"
+        
+        return prompt
+
+    def _unload_local_model(self):
+        config.console.print("[yellow]检测到云端模式，正在清理本地显存占用...[/yellow]")
+        try:
+            payload = {"model": self.ollama_model, "keep_alive": 0}
+            requests.post(config.OLLAMA_URL, json=payload, timeout=2.0)
+            config.console.print("[green]✔ 本地显存已释放。[/green]")
+        except Exception:
+            pass
+
+    def _init_deepseek(self):
+        if not self.deepseek_key:
+            config.console.print("[red]❌ DeepSeek API Key 未配置！请在设置中填写。[/red]")
+            return
+        
+        try:
+            self.ds_client = OpenAI(
+                api_key=self.deepseek_key, 
+                base_url=config.DEEPSEEK_BASE_URL
+            )
+            # DeepSeek 使用 messages 传递 system prompt
+            self.history = [{"role": "system", "content": self.system_prompt_text}]
+            config.console.print(f"[green]✔ DeepSeek V3 API 已连接[/green]")
+        except Exception as e:
+            config.console.print(f"[red]❌ DeepSeek 初始化失败: {e}[/red]")
 
     def _warmup_neural_engine(self):
-        """
-        主动预热：强制加载模型到显存
-        """
-        config.console.print("\n[bold magenta]>>> 系统正在执行冷启动 (Cold Start)...[/bold magenta]")
-        config.console.print("[dim]正在将神经网络完整加载到本地计算核心显存中，请稍候...[/dim]")
+        config.console.print("[dim]正在预热本地神经网络...[/dim]")
+        try:
+            payload = {
+                "model": self.ollama_model,
+                "messages": [{"role": "system", "content": "init"}],
+                "stream": False 
+            }
+            requests.post(config.OLLAMA_URL, json=payload, timeout=60)
+            self.is_cold_start = False
+            config.console.print("[bold green]✔ 本地大脑已就绪。[/bold green]")
+        except Exception as e:
+            config.console.print(f"[red]⚠ 本地预热失败: {e}[/red]")
 
-        with config.console.status("[bold magenta]正在唤醒神经网络...[/bold magenta]", spinner="dots"):
-            try:
-                payload = {
-                    "model": config.TARGET_MODEL,
-                    "messages": [{"role": "system", "content": "init"}],
-                    "stream": False 
-                }
-                requests.post(config.OLLAMA_URL, json=payload, timeout=60)
-                
-                self.is_cold_start = False
-                config.console.print("[bold green]✔ 神经网络已激活。系统就绪。[/bold green]")
-                
-            except Exception as e:
-                config.console.print(f"[red]⚠ 冷启动预热请求失败: {e}[/red]")
-                config.console.print("[dim]系统仍将尝试运行，但第一次对话可能会变慢。[/dim]")
+    def _extract_emotion(self, text):
+        match = re.match(r'^\[(\w+)\]\s*(.*)', text, re.DOTALL)
+        if match:
+            return match.group(1).lower(), match.group(2)
+        return "neutral", text
+
+    def _clean_text_for_display(self, text):
+        """
+        [新增] 显示层文本清洗
+        强力去除所有括号内容，避免 AI 的内心戏 (sigh) 出现在气泡里
+        """
+        if not text: return ""
+        # 去除中文括号、英文括号、中括号及其内容
+        text = re.sub(r'[\（\(\[].*?[\）\)\]]', '', text)
+        # 去除 Markdown
+        text = text.replace('*', '')
+        return text.strip()
 
     def think(self, user_input):
-        """执行认知推理"""
+        if self.brain_type == "deepseek":
+            return self._think_with_deepseek(user_input)
+        else:
+            return self._think_with_ollama(user_input)
+
+    def _think_with_deepseek(self, user_input):
+        if not self.ds_client:
+            return {"text": "[Error] DeepSeek Key missing.", "raw": "", "emotion": "neutral", "duration": 0, "payload": {}}
+
+        self.history.append({"role": "user", "content": user_input})
+        start_time = time.time()
+        
+        with config.console.status("[bold purple]DeepSeek Thinking...[/bold purple]", spinner="dots"):
+            try:
+                # 捕获请求负载用于 Debug
+                debug_payload = {
+                    "model": config.DEEPSEEK_MODEL,
+                    "messages": self.history[-10:] # 只显示最近10条，防止debug刷屏
+                }
+
+                response = self.ds_client.chat.completions.create(
+                    model=config.DEEPSEEK_MODEL,
+                    messages=self.history,
+                    stream=False
+                )
+                
+                raw_text = response.choices[0].message.content
+                duration = time.time() - start_time
+                self.last_stats["brain_time"] = duration
+                
+                self.history.append({"role": "assistant", "content": raw_text})
+                
+                emotion, temp_text = self._extract_emotion(raw_text)
+                clean_text = self._clean_text_for_display(temp_text) # 二次清洗
+                
+                self.current_emotion = emotion
+                
+                return {
+                    "text": clean_text,
+                    "emotion": emotion,
+                    "duration": duration,
+                    "raw": raw_text,
+                    "payload": debug_payload # 返回给 GUI
+                }
+            except Exception as e:
+                config.console.print(f"[red]DeepSeek API Error: {e}[/red]")
+                return None
+
+    def _think_with_ollama(self, user_input):
         self.history.append({"role": "user", "content": user_input})
         
-        with config.console.status("[bold cyan]Thinking...[/bold cyan]", spinner="dots"):
+        with config.console.status("[bold cyan]Ollama Thinking...[/bold cyan]", spinner="dots"):
             try:
-                payload = {
-                    "model": config.TARGET_MODEL,
-                    "messages": self.history,
-                    "stream": False 
-                }
+                # 捕获请求负载
+                payload = {"model": self.ollama_model, "messages": self.history, "stream": False}
                 
                 start_time = time.time()
                 response = requests.post(config.OLLAMA_URL, json=payload)
                 end_time = time.time()
                 
                 if response.status_code == 200:
-                    response_json = response.json()
-                    ai_text = response_json["message"]["content"]
-                    self.history.append({"role": "assistant", "content": ai_text})
-                    
+                    raw_text = response.json()["message"]["content"]
                     duration = end_time - start_time
-                    config.console.print(f"\n[bold cyan]Ethereal ({duration:.2f}s):[/bold cyan] {ai_text}")
-                    return ai_text
+                    self.last_stats["brain_time"] = duration
+                    
+                    self.history.append({"role": "assistant", "content": raw_text})
+                    emotion, temp_text = self._extract_emotion(raw_text)
+                    clean_text = self._clean_text_for_display(temp_text)
+                    self.current_emotion = emotion
+                    
+                    # 简化 payload 显示，截取部分历史
+                    debug_payload = payload.copy()
+                    debug_payload["messages"] = payload["messages"][-5:] 
+
+                    return {
+                        "text": clean_text,
+                        "emotion": emotion,
+                        "duration": duration,
+                        "raw": raw_text,
+                        "payload": debug_payload
+                    }
                 else:
-                    config.console.print(f"[red]Ollama Error: {response.text}[/red]")
                     return None
-                
             except Exception as e:
-                config.console.print(f"[red]Brain Connection Failed:[/red] {e}")
                 return None
 
     def speak(self, text):
-        """委托给 TTS 引擎表达"""
+        start_time = time.time()
+        # TTS 引擎有自己的清洗逻辑，这里传入 text 或 clean_text 都可以，建议传 clean_text
         self.tts.speak(text)
+        duration = time.time() - start_time
+        self.last_stats["mouth_time"] = duration
+        return duration
 
     def terminate(self):
-        config.console.print("\n[yellow]正在切断神经连接并释放本地计算资源...[/yellow]")
-        try:
-            payload = {
-                "model": config.TARGET_MODEL,
-                "keep_alive": 0 
-            }
-            requests.post(config.OLLAMA_URL, json=payload, timeout=2.0)
-            config.console.print("[green]✔ 模型已从显存卸载。系统休眠。[/green]")
-        except Exception:
-            pass
+        self._unload_local_model()

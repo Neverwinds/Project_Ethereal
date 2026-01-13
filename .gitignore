@@ -80,3 +80,6 @@ tmp/
 *.sqlite
 *.sqlite3
 vector_db/
+*.json
+*.json
+*.json
