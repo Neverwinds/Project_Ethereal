@@ -32,8 +32,8 @@ DEEPSEEK_MODEL = "deepseek-chat"
 
 # 3. 嘴巴配置 (GPT-SoVITS)
 TTS_API_URL = "http://127.0.0.1:9880/tts" 
-GPT_SOVITS_DIR = r"D:\AI\GPT-SoVITS" 
-TTS_LAUNCH_SCRIPT = "启动API.bat"
+GPT_SOVITS_DIR = r"F:\00_Software\GPT-SoVITS-1007-cu128" 
+TTS_LAUNCH_SCRIPT = "go-api.bat"
 
 # 4. 文件路径
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")

@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <!-- ... Head 部分保持不变 ... -->
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ethereal Live2D Viewer</title>
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; background-color: rgba(0, 0, 0, 0.1); }
+        canvas { display: block; }
+        #status {
+            position: absolute; top: 10px; left: 10px; color: lime;
+            font-family: "Consolas", monospace; background: rgba(0,0,0,0.8);
+            padding: 10px; pointer-events: none; z-index: 999;
+            font-size: 12px; max-width: 80%; border-radius: 5px;
+        }
+        .error { color: #ff5555 !important; }
+    </style>
+    
+    <script src="https://cubism.live2d.com/sdk-web/cubismcore/live2dcubismcore.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pixi.js/6.5.2/browser/pixi.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/pixi-live2d-display@0.4.0/dist/cubism4.min.js"></script>
+</head>
+<body>
+    <div id="status">Initializing...</div>
+    <canvas id="canvas"></canvas>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+        function logStatus(text, isError = false) {
+            statusDiv.innerText = text;
+            if (isError) statusDiv.style.color = "#ff5555";
+            console.log("[System]", text);
+        }
+
+        window.PIXI = PIXI; 
+        const socket = new WebSocket("ws://127.0.0.1:8000/ws");
+        socket.onopen = () => logStatus("WS: Connected.");
+        socket.onerror = (e) => logStatus("WS: Error!", true);
+
+        const MODEL_PATH = "/live2d_models/hiyori/hiyori_free_t08.model3.json"; 
+
+        const app = new PIXI.Application({
+            view: document.getElementById('canvas'),
+            autoStart: true,
+            resizeTo: window,
+            backgroundAlpha: 0
+        });
+
+        let model;
+        let currentMouthY = 0; 
+
+        async function loadModel() {
+            try {
+                const check = await fetch(MODEL_PATH);
+                if (!check.ok) throw new Error(`HTTP ${check.status}: Path not found`);
+                
+                // [修改 1] 加载时显式禁用交互
+                model = await PIXI.live2d.Live2DModel.from(MODEL_PATH, { autoInteract: false });
+                
+                // [修改 2] 彻底禁用自动播放属性
+                model.autoplay = false;
+
+                // [修改 3] 手术级切除：从定义中彻底删除 Idle 组
+                if (model.internalModel && model.internalModel.motionManager) {
+                    const mgr = model.internalModel.motionManager;
+                    
+                    // 1. 设置 idle 分组指针为空
+                    mgr.idleMotionGroup = null;
+                    
+                    // 2. 遍历并删除所有名字里带 'idle' 的动作组定义
+                    if (mgr.definitions) {
+                        Object.keys(mgr.definitions).forEach(group => {
+                            if (group.toLowerCase().includes("idle")) {
+                                console.log(`[System] Deleting motion group: ${group}`);
+                                delete mgr.definitions[group];
+                            }
+                        });
+                    }
+                    
+                    // 3. 强制停止当前可能已经开始的动作
+                    mgr.stopAllMotions();
+                    
+                    logStatus("Idle motions PERMANENTLY DISABLED.");
+                }
+
+                app.stage.addChild(model);
+                fitModel(model);
+                logStatus("Model Active (Static Mode)!");
+                
+                // 仅保留点击触发 (用于测试)
+                model.interactive = true;
+                model.on("pointertap", () => model.motion("TapBody"));
+
+            } catch (error) {
+                console.error(error);
+                logStatus("Error: " + error.message, true);
+            }
+        }
+
+        function fitModel(model) {
+            if (!model.width) return;
+            const scale = Math.min((window.innerWidth * 0.5) / model.width, (window.innerHeight * 0.8) / model.height);
+            model.scale.set(scale);
+            model.x = (window.innerWidth - model.width * scale) / 2;
+            model.y = (window.innerHeight - model.height * scale) / 2 + (window.innerHeight * 0.1);
+        }
+
+        // 保持强制覆盖嘴巴参数的逻辑
+        app.ticker.add(() => {
+            if (model && model.internalModel && model.internalModel.coreModel) {
+                model.internalModel.coreModel.setParameterValueById('ParamMouthOpenY', currentMouthY);
+            }
+        });
+
+        loadModel();
+
+        socket.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+
+            if (data.type === "expression") {
+                logStatus("Expr: " + data.value);
+                // ... (表情控制逻辑) ...
+            }
+
+            if (data.type === "lipsync") {
+                currentMouthY = data.value;
+            }
+        };
+        
+        window.onresize = () => { if (model) fitModel(model); };
+    </script>
+</body>
+</html>
