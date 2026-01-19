@@ -266,6 +266,26 @@ class EtherealApp(ctk.CTk):
         self._add_section_header(parent, "LOCAL CONFIG", r); r+=1
         self.entry_ollama_model = self._add_input_field(parent, "Model Name", r); r+=2
         
+        self._add_section_header(parent, "GENERATION PARAMS", r); r+=1
+        
+        # Temperature
+        ctk.CTkLabel(parent, text="Temperature (Creativity)", font=("Consolas", 11), text_color="gray").grid(row=r, column=0, sticky="w", padx=20, pady=(5,0))
+        self.slider_temp = ctk.CTkSlider(parent, from_=0.0, to=2.0, number_of_steps=20)
+        self.slider_temp.grid(row=r+1, column=0, sticky="ew", padx=(20, 60), pady=(0,5))
+        self.label_temp_val = ctk.CTkLabel(parent, text="0.7", font=("Consolas", 11), text_color="#a1a1aa", width=30)
+        self.label_temp_val.grid(row=r+1, column=0, sticky="e", padx=20)
+        self.slider_temp.configure(command=lambda v: self.label_temp_val.configure(text=f"{v:.1f}"))
+        r+=2
+        
+        # Top P
+        ctk.CTkLabel(parent, text="Top P (Focus)", font=("Consolas", 11), text_color="gray").grid(row=r, column=0, sticky="w", padx=20, pady=(5,0))
+        self.slider_top_p = ctk.CTkSlider(parent, from_=0.0, to=1.0, number_of_steps=20)
+        self.slider_top_p.grid(row=r+1, column=0, sticky="ew", padx=(20, 60), pady=(0,15))
+        self.label_top_p_val = ctk.CTkLabel(parent, text="0.9", font=("Consolas", 11), text_color="#a1a1aa", width=30)
+        self.label_top_p_val.grid(row=r+1, column=0, sticky="e", padx=20)
+        self.slider_top_p.configure(command=lambda v: self.label_top_p_val.configure(text=f"{v:.1f}"))
+        r+=2
+        
         self._add_section_header(parent, "CLOUD CONFIG", r); r+=1
         self.entry_deepseek_key = self._add_input_field(parent, "DeepSeek API Key", r); r+=2
 
@@ -296,6 +316,13 @@ class EtherealApp(ctk.CTk):
             self.combo_brain.set(s.get("brain_type", "ollama"))
             self._set_text(self.entry_ollama_model, s.get("ollama_model", config.OLLAMA_MODEL))
             
+            temp = s.get("temperature", 0.7)
+            top_p = s.get("top_p", 0.9)
+            self.slider_temp.set(temp)
+            self.label_temp_val.configure(text=f"{temp:.1f}")
+            self.slider_top_p.set(top_p)
+            self.label_top_p_val.configure(text=f"{top_p:.1f}")
+            
             if os.path.exists(config.SECRETS_CONFIG_PATH):
                 with open(config.SECRETS_CONFIG_PATH, 'r', encoding='utf-8') as f:
                     sec = json.load(f)
@@ -324,6 +351,8 @@ class EtherealApp(ctk.CTk):
             if "system_settings" not in data: data["system_settings"] = {}
             data["system_settings"]["brain_type"] = self.combo_brain.get()
             data["system_settings"]["ollama_model"] = self._get_text(self.entry_ollama_model)
+            data["system_settings"]["temperature"] = round(self.slider_temp.get(), 2)
+            data["system_settings"]["top_p"] = round(self.slider_top_p.get(), 2)
             
             with open(config.CHARACTER_CONFIG_PATH, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4, ensure_ascii=False)
             

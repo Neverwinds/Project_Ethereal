@@ -84,3 +84,5 @@ vector_db/
 *.json
 *.json
 *.pdf
+/.trae
+/markdown

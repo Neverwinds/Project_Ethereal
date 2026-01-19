@@ -14,12 +14,13 @@ from rich.panel import Panel
 class TTSEngine:
     """
     Project Ethereal 语音合成引擎 (The Mouth)
-    [V2.4] 口型柔和版 - 降低增益，增加细腻度
+    [V2.6] 修复音画同步延迟 - 将表情触发延迟到播放时刻
     """
-    def __init__(self, voice_config, lip_sync_callback=None):
+    def __init__(self, voice_config, lip_sync_callback=None, expression_callback=None):
         self.voice_cfg = voice_config
         self.enabled = False
         self.lip_sync_callback = lip_sync_callback
+        self.expression_callback = expression_callback # [新增] 表情回调
         self.audio_stream = None 
         
         self._ensure_service_running()
@@ -78,19 +79,34 @@ class TTSEngine:
 
     def _clean_text(self, text):
         if not text: return ""
+        # 移除 [] () 中的内容
         text = re.sub(r'[\（\(\[].*?[\）\)\]]', '', text)
-        text = text.replace('*', '')
+        # 移除 *...* 中的动作描述
+        text = re.sub(r'\*.*?\*', '', text)
+        
         text = re.sub(r'[—~-]{1,}', '，', text)
         text = re.sub(r'["\'“”‘’]', '', text)
         text = re.sub(r'\s+', ' ', text).strip()
         return text if text else "..."
 
-    def speak(self, text):
-        """执行语音合成并播放"""
+    def speak(self, text, emotion="neutral"):
+        """
+        执行语音合成并播放
+        [修改] 接收 emotion 参数
+        """
         if not self.enabled or not text:
+            # [新增] 即使不说话，也要负责重置表情，防止卡在 Thinking
+            if self.expression_callback:
+                self.expression_callback("neutral")
             return
 
         clean_text = self._clean_text(text)
+        
+        # [新增] 清洗后如果没字了，也要重置
+        if not clean_text or clean_text == "...":
+            if self.expression_callback:
+                self.expression_callback("neutral")
+            return
         
         with config.console.status(f"[bold blue]Synthesizing: '{clean_text}'...[/bold blue]", spinner="bouncingBar"):
             try:
@@ -102,22 +118,33 @@ class TTSEngine:
                     "prompt_lang": self.voice_cfg.get("prompt_lang", "zh"),  
                 }
                 
+                # 这里是耗时操作 (约1-2秒)
                 response = requests.get(config.TTS_API_URL, params=params, timeout=30)
 
                 if response.status_code == 200:
                     audio_data = io.BytesIO(response.content)
                     data, fs = sf.read(audio_data, dtype='float32')
+                    
+                    # --- [核心修复] ---
+                    # 音频下载完毕，准备播放了，这时候再触发表情
+                    # 这样表情和声音就是同步的
+                    if self.expression_callback:
+                        self.expression_callback(emotion)
+                    
                     self._play_with_lipsync(data, fs)
                 else:
                     config.console.print(f"[red]TTS API Error ({response.status_code})[/red]")
+                    # [新增] API 错误也要重置
+                    if self.expression_callback:
+                        self.expression_callback("neutral")
 
             except Exception as e:
                 config.console.print(f"[red]Audio Error:[/red] {e}")
+                # [新增] 异常也要重置
+                if self.expression_callback:
+                    self.expression_callback("neutral")
 
     def _play_with_lipsync(self, data, fs):
-        """
-        [调优版] 播放音频并在回调中计算合理的口型值
-        """
         if data.ndim > 1:
             amplitude_data = np.mean(data, axis=1)
         else:
@@ -143,22 +170,17 @@ class TTSEngine:
             else:
                 outdata[:] = chunk.reshape(-1, 1) if chunk.ndim == 1 else chunk
             
-            # --- [算法优化核心 V2.4] ---
+            # 保持之前的参数：门限 0.002, 增益 4.0
             if len(amp_chunk) > 0:
                 rms = np.sqrt(np.mean(amp_chunk**2))
             else:
                 rms = 0.0
             
-            # 1. 保持底噪过滤
             if rms < 0.002:
                 lipsync_value = 0.0
             else:
-                # 2. 降低增益：从 6.0 降至 4.0
-                # 这样 0.2 的音量 (大声) * 4 = 0.8，不会封顶
-                # 0.1 的音量 (正常) * 4 = 0.4
                 lipsync_value = min(1.0, rms * 4.0)
 
-            # 3. [关键] 强制转换为纯 Python float，防止 Numpy 类型干扰 JSON 序列化
             lipsync_value = float(lipsync_value)
 
             if self.lip_sync_callback:
@@ -174,3 +196,7 @@ class TTSEngine:
             
         if self.lip_sync_callback:
             self.lip_sync_callback(0.0)
+            
+        # [新增] 播放结束后，恢复 Neutral 表情 (Decay)
+        if self.expression_callback:
+            self.expression_callback("neutral")

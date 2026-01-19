@@ -7,92 +7,244 @@ import config
 class VTSAdapter:
     """
     Project Ethereal -> VTube Studio 桥接器
-    负责处理鉴权、连接以及高频参数注入
     """
     def __init__(self):
-        # 定义插件信息
         self.plugin_info = {
             "plugin_name": "Ethereal Core",
             "developer": "Master",
             "authentication_token_path": "./vts_token.txt"
         }
-        
-        # 初始化 pyvts
+
         self.vts = pyvts.vts(plugin_info=self.plugin_info)
         self.connected = False
         self.event_loop = None
-        
-        # 启动后台连接线程 (VTS 通讯必须在 Asyncio 循环中运行)
+
+        # WebSocket 请求锁，防止并发调用 recv() 导致冲突
+        self._request_lock = None
+
+        # 存储表情列表: { "ExpressionName": "ExpressionFile" }
+        self.expression_cache = {}
+        # 当前激活的表情文件名
+        self.current_expression = None
+        # 表情切换的淡入淡出时间 (秒)
+        self.expression_fade_time = 0.5
+
         threading.Thread(target=self._run_loop, daemon=True).start()
 
     def _run_loop(self):
-        """在后台线程运行 Asyncio Loop"""
         self.event_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.event_loop)
         self.event_loop.run_until_complete(self._connect_and_auth())
         self.event_loop.run_forever()
 
     async def _connect_and_auth(self):
-        """连接并鉴权"""
         try:
-            # 1. 尝试连接
+            # 在 event loop 中初始化请求锁
+            self._request_lock = asyncio.Lock()
+
             await self.vts.connect()
-            
-            # 2. 尝试鉴权
-            # pyvts 会自动读取 token 文件，如果没有则请求新 token
-            await self.vts.request_authenticate_token() 
+            await self.vts.request_authenticate_token()
             await self.vts.request_authenticate()
-            
+
             self.connected = True
             config.console.print("[green]✔ VTube Studio Link Established![/green]")
-            config.console.print("[dim]提示: 如果 VTube Studio 弹出请求，请点击 'Allow'[/dim]")
-            
+
+            # 连接成功后，立即请求表情列表
+            await self._fetch_expressions()
+
         except Exception as e:
             config.console.print(f"[red]❌ VTS Connection Failed: {e}[/red]")
-            config.console.print("[yellow]请确保 VTube Studio 已打开并在设置中开启了 API (端口8001)[/yellow]")
+
+    async def _safe_request(self, payload):
+        """
+        线程安全的 VTS 请求，使用锁防止 WebSocket 并发调用冲突
+        """
+        async with self._request_lock:
+            return await self.vts.request(payload)
+
+    async def _fetch_expressions(self):
+        """获取当前模型的所有表情文件"""
+        try:
+            response = await self._safe_request({
+                "apiName": "VTubeStudioPublicAPI",
+                "apiVersion": "1.0",
+                "requestID": "GetExpressions",
+                "messageType": "ExpressionStateRequest",
+                "data": {
+                    "details": False
+                }
+            })
+
+            if "data" in response and "expressions" in response["data"]:
+                expressions = response["data"]["expressions"]
+                config.console.print("\n[cyan]--- VTS Available Expressions ---[/cyan]")
+                self.expression_cache.clear()
+                for expr in expressions:
+                    name = expr.get("name", "Unknown")
+                    file = expr.get("file", "")
+                    active = expr.get("active", False)
+                    self.expression_cache[name] = file
+                    status = "[green]✓[/green]" if active else " "
+                    config.console.print(f"{status} Name: {name: <20} | File: {file}")
+                config.console.print("----------------------------------\n")
+        except Exception as e:
+            config.console.print(f"[red]Failed to fetch expressions: {e}[/red]")
+
+    def find_expression(self, name_query):
+        """
+        根据名称查找表情文件名 (模糊匹配)
+        """
+        # 1. 精确匹配
+        if name_query in self.expression_cache:
+            return self.expression_cache[name_query]
+
+        # 2. 不区分大小写匹配
+        name_lower = name_query.lower()
+        for name, file in self.expression_cache.items():
+            if name.lower() == name_lower:
+                return file
+
+        # 3. 包含匹配 (比如 query="happy", actual="Happy Expression")
+        for name, file in self.expression_cache.items():
+            if name_lower in name.lower():
+                return file
+
+        return None
+
+    def set_expression_by_name(self, name_query, fade_time=None):
+        """
+        根据名称切换表情 (互斥切换 - 先关闭当前表情，再开启新表情)
+        
+        Args:
+            name_query: 表情名称 (支持模糊匹配)。如果是 "Neutral" 或 "neutral"，则关闭当前表情。
+            fade_time: 淡入淡出时间 (秒)，None 则使用默认值
+        """
+        # 特殊处理 Neutral: 直接关闭当前表情
+        if name_query.lower() == "neutral":
+            if self.current_expression:
+                config.console.print("[VTS] Resetting to Neutral (Deactivating current)")
+                if fade_time is None: fade_time = self.expression_fade_time
+                async def _reset():
+                    await self._deactivate_expression(self.current_expression, fade_time)
+                    self.current_expression = None
+                asyncio.run_coroutine_threadsafe(_reset(), self.event_loop)
+            return
+
+        expr_file = self.find_expression(name_query)
+        if expr_file:
+            config.console.print(f"[VTS] Found expression '{name_query}' -> File: {expr_file}")
+            self.set_expression(expr_file, fade_time)
+        else:
+            config.console.print(f"[VTS] Expression not found for query: {name_query}")
+
+    def set_expression(self, expression_file, fade_time=None):
+        """
+        切换到指定表情文件 (互斥切换)
+
+        Args:
+            expression_file: 表情文件名 (如 "Happy.exp3.json")
+            fade_time: 淡入淡出时间 (秒)，None 则使用默认值
+        """
+        if not self.connected or self.event_loop is None:
+            return
+
+        if fade_time is None:
+            fade_time = self.expression_fade_time
+
+        # 如果要切换到同一个表情，跳过
+        if self.current_expression == expression_file:
+            config.console.print(f"[VTS] Expression already active: {expression_file}")
+            return
+
+        async def _switch():
+            try:
+                # 1. 先关闭当前激活的表情 (如果有)
+                if self.current_expression:
+                    await self._deactivate_expression(self.current_expression, fade_time)
+
+                # 2. 激活新表情
+                await self._activate_expression(expression_file, fade_time)
+                self.current_expression = expression_file
+
+            except Exception as e:
+                config.console.print(f"[red]Failed to switch expression: {e}[/red]")
+
+        asyncio.run_coroutine_threadsafe(_switch(), self.event_loop)
+
+    async def _activate_expression(self, expression_file, fade_time):
+        """激活表情"""
+        payload = {
+            "apiName": "VTubeStudioPublicAPI",
+            "apiVersion": "1.0",
+            "requestID": "ActivateExpression",
+            "messageType": "ExpressionActivationRequest",
+            "data": {
+                "expressionFile": expression_file,
+                "active": True,
+                "fadeTime": fade_time
+            }
+        }
+        await self._safe_request(payload)
+        config.console.print(f"[VTS] Activated expression: {expression_file} (fade: {fade_time}s)")
+
+    async def _deactivate_expression(self, expression_file, fade_time):
+        """关闭表情"""
+        payload = {
+            "apiName": "VTubeStudioPublicAPI",
+            "apiVersion": "1.0",
+            "requestID": "DeactivateExpression",
+            "messageType": "ExpressionActivationRequest",
+            "data": {
+                "expressionFile": expression_file,
+                "active": False,
+                "fadeTime": fade_time
+            }
+        }
+        await self._safe_request(payload)
+        config.console.print(f"[VTS] Deactivated expression: {expression_file}")
+
+    async def _deactivate_all_expressions(self, fade_time=None):
+        """关闭所有激活的表情"""
+        if fade_time is None:
+            fade_time = self.expression_fade_time
+
+        try:
+            # 获取当前表情状态
+            response = await self._safe_request({
+                "apiName": "VTubeStudioPublicAPI",
+                "apiVersion": "1.0",
+                "requestID": "GetExpressions",
+                "messageType": "ExpressionStateRequest",
+                "data": {"details": False}
+            })
+
+            if "data" in response and "expressions" in response["data"]:
+                for expr in response["data"]["expressions"]:
+                    if expr.get("active", False):
+                        await self._deactivate_expression(expr["file"], fade_time)
+
+            self.current_expression = None
+        except Exception as e:
+            config.console.print(f"[red]Failed to deactivate expressions: {e}[/red]")
 
     def set_mouth_open(self, value):
-        """
-        [口型同步接口]
-        直接注入参数控制嘴巴
-        VTS 标准参数名: MouthOpen (0.0 - 1.0)
-        """
-        if not self.connected or self.event_loop is None: 
-            return
+        if not self.connected or self.event_loop is None: return
         
         async def _send():
             try:
-                # [关键修复] 手动构造请求字典，绕过 pyvts 版本兼容问题
                 payload = {
                     "apiName": "VTubeStudioPublicAPI",
                     "apiVersion": "1.0",
                     "requestID": "LipSync",
                     "messageType": "InjectParameterDataRequest",
                     "data": {
-                        "faceFound": False, # 强制覆盖摄像头捕捉
+                        "faceFound": False,
                         "mode": "set",
-                        "parameterValues": [
-                            {
-                                "id": "MouthOpen",
-                                "value": value,
-                                "weight": 1.0
-                            }
-                        ]
+                        "parameterValues": [{"id": "MouthOpen", "value": value, "weight": 1.0}]
                     }
                 }
-                await self.vts.request(payload)
+                await self._safe_request(payload)
             except Exception:
-                pass # 高频数据允许偶尔丢包，不打印错误以免刷屏
-        
-        # 将发送任务扔进后台循环，非阻塞执行
-        asyncio.run_coroutine_threadsafe(_send(), self.event_loop)
+                pass
 
-    def set_expression(self, emotion):
-        """
-        [表情触发接口]
-        触发 VTS 里的 Hotkey (需要你在 VTS 里提前配好按键)
-        这里作为预留接口，因为 VTS 的表情调用比较复杂，通常建议映射到参数
-        """
-        # 简单打印一下，证明信号通了
-        # config.console.print(f"[VTS] Trigger Emotion: {emotion}")
-        pass
+        asyncio.run_coroutine_threadsafe(_send(), self.event_loop)
