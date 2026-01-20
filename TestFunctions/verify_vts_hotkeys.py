@@ -1,4 +1,12 @@
 import asyncio
+import sys
+import os
+
+# Add parent directory to path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
 import pyvts
 import config
 
@@ -9,7 +17,7 @@ class SimpleAdapter:
         self.plugin_info = {
             "plugin_name": "Ethereal Core",
             "developer": "Master",
-            "authentication_token_path": "./vts_token.txt"
+            "authentication_token_path": os.path.join(parent_dir, "vts_token.txt")
         }
         self.vts = pyvts.vts(plugin_info=self.plugin_info)
 

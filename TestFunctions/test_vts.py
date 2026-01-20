@@ -2,6 +2,13 @@ import asyncio
 import pyvts
 import time
 import json
+import os
+import sys
+
+# Add parent directory to path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
 
 async def main():
     print("=== VTube Studio 嘴型控制测试 ===")
@@ -10,7 +17,7 @@ async def main():
     plugin_info = {
         "plugin_name": "Ethereal Core",
         "developer": "Master",
-        "authentication_token_path": "./vts_token.txt"
+        "authentication_token_path": os.path.join(parent_dir, "vts_token.txt")
     }
     
     vts = pyvts.vts(plugin_info=plugin_info)

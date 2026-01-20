@@ -1,3 +1,7 @@
 requests 
 pygame 
 rich
+pyaudio
+faster-whisper
+torch
+numpy
