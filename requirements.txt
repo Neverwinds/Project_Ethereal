@@ -2,6 +2,9 @@ requests
 pygame 
 rich
 pyaudio
-faster-whisper
+funasr
+modelscope
 torch
+torchaudio
+transformers
 numpy

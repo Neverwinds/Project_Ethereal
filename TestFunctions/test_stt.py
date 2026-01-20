@@ -15,6 +15,7 @@ console = Console()
 def on_speech_recognized(perception_data):
     console.print(f"[bold magenta]Callback received:[/bold magenta] {perception_data['text']}")
     console.print(f"[dim cyan]Metadata: Emotion={perception_data['emotion']}, Event={perception_data['event']}, Lang={perception_data['lang']}[/dim cyan]")
+    console.print(f"[dim]Debug: Raw='{perception_data['raw']}'[/dim]")
 
 def main():
     console.print("[bold]Testing STTEngine (SenseVoiceSmall)...[/bold]")

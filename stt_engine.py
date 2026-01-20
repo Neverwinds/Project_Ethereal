@@ -13,15 +13,38 @@ console = Console()
 
 class STTEngine:
     """
-    Speech-to-Text Engine using SenseVoiceSmall (via FunASR) and Silero VAD.
+    Speech-to-Text Engine using SenseVoiceSmall (via FunASR) for accurate text,
+    emotion and event detection.
     """
+    
+    # SenseVoiceSmall Supported Tags
+    # Emotions (Reference)
+    EMOTION_TAGS = {
+        "HAPPY": "Happy / 开心",
+        "SAD": "Sad / 悲伤",
+        "ANGRY": "Angry / 愤怒",
+        "NEUTRAL": "Neutral / 中性",
+    }
+    
+    # Audio Events (Reference)
+    EVENT_TAGS = {
+        "Laughter": "Laughter / 笑声",
+        "Music": "Music / 音乐",
+        "Speech": "Speech / 说话",
+        "Applause": "Applause / 掌声",
+        "Cry": "Cry / 哭声",
+        "Sneeze": "Sneeze / 喷嚏",
+        "Cough": "Cough / 咳嗽",
+        "Breath": "Breath / 呼吸声"
+    }
+
     def __init__(self, callback, device="cuda"):
         """
         Initialize the STT Engine.
 
         Args:
             callback (function): Function to call with transcribed text and metadata.
-                                 Signature: callback(text, metadata_dict)
+                                 Signature: callback(perception_data)
             device (str): Device to run models on ("cuda" or "cpu").
         """
         self.callback = callback
@@ -40,7 +63,7 @@ class STTEngine:
         self.silence_duration_threshold = 0.8
         self.min_speech_duration_ms = 250
         
-        console.log(f"[bold green]Initializing STT Engine (SenseVoiceSmall)...[/bold green]")
+        console.log(f"[bold green]Initializing STT Engine (SenseVoice)...[/bold green]")
 
         # Check CUDA availability
         if device == "cuda" and not torch.cuda.is_available():
@@ -52,34 +75,42 @@ class STTEngine:
         self.vad_device = "cpu" # Force VAD to CPU to avoid CUDA compatibility issues
         
         try:
-            # Load Silero VAD
-            console.log(f"Loading Silero VAD model on {self.vad_device}...")
-            self.vad_model, utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False,
-                onnx=False
-            )
-            (self.get_speech_timestamps, self.save_audio, self.read_audio, self.VADIterator, self.collect_chunks) = utils
-            self.vad_model.to(self.vad_device)
-            console.log("[green]Silero VAD loaded.[/green]")
-
-            # Load SenseVoiceSmall
-            console.log(f"Loading SenseVoiceSmall model on {device}...")
-            # disable_update=True to avoid checking for updates at runtime
-            self.model = AutoModel(
-                model="iic/SenseVoiceSmall",
-                device=device,
-                disable_update=True,
-                hub="ms" # Use ModelScope
-            )
-            console.log("[green]SenseVoiceSmall loaded.[/green]")
+            self._init_models(device)
             
         except Exception as e:
             console.print(f"[bold red]Error initializing models:[/bold red] {e}")
             raise e
 
         self.p = pyaudio.PyAudio()
+
+    def _init_models(self, device):
+        """Initialize all AI models."""
+        
+        # 1. Load Silero VAD
+        console.log(f"Loading Silero VAD model on {self.vad_device}...")
+        self.vad_model, utils = torch.hub.load(
+            repo_or_dir='snakers4/silero-vad',
+            model='silero_vad',
+            force_reload=False,
+            onnx=False
+        )
+        (self.get_speech_timestamps, self.save_audio, self.read_audio, self.VADIterator, self.collect_chunks) = utils
+        self.vad_model.to(self.vad_device)
+        console.log("[green]Silero VAD loaded.[/green]")
+
+        # 2. Load SenseVoiceSmall (ASR & Events & Emotion)
+        console.log(f"Loading SenseVoiceSmall on {device}...")
+        # disable_update=True to avoid checking for updates at runtime
+        self.asr_model = AutoModel(
+            model="iic/SenseVoiceSmall",
+            device=device,
+            disable_update=True,
+            hub="ms", # Use ModelScope
+            log_level="ERROR"
+        )
+        console.log("[green]SenseVoiceSmall loaded.[/green]")
+
+        console.log("[bold green]All systems initialized.[/bold green]")
 
     def start_listening(self):
         """Start the audio recording and processing thread."""
@@ -154,8 +185,8 @@ class STTEngine:
                             silence_start_time = current_time
                         
                         if current_time - silence_start_time > self.silence_duration_threshold:
-                            console.log("[dim]End of sentence detected. Transcribing...[/dim]")
-                            self._transcribe_buffer(speech_buffer)
+                            console.log("[dim]End of sentence detected. Processing...[/dim]")
+                            self._process_speech(speech_buffer)
                             
                             speech_buffer = []
                             is_speaking = False
@@ -169,120 +200,102 @@ class STTEngine:
         stream.stop_stream()
         stream.close()
 
-    def _transcribe_buffer(self, buffer):
-        """Transcribe the accumulated audio buffer using SenseVoice."""
+    def _process_speech(self, buffer):
+        """
+        Process audio with SenseVoice for ASR, emotion and event detection.
+        """
         if not buffer:
             return
 
-        # Combine all chunks
+        # Combine chunks
         full_audio_int16 = np.concatenate(buffer)
-        
-        # Convert int16 to float32 and normalize to [-1, 1]
-        # SenseVoice/FunASR requires float32 input to avoid 'normal_kernel_cpu' not implemented for 'Short' error
+
+        # Convert to float32 normalized for SenseVoice
         full_audio_float32 = full_audio_int16.astype(np.float32) / 32768.0
-        
+
         try:
-            # Inference
-            res = self.model.generate(
+            # SenseVoice expects input array directly
+            asr_res = self.asr_model.generate(
                 input=full_audio_float32,
                 cache={},
-                language="auto", 
+                language="auto",
                 use_itn=True,
                 batch_size_s=60
             )
-            
-            # Result format is typically a list of dicts: [{'text': '...'}]
-            if res and isinstance(res, list) and len(res) > 0:
-                raw_text = res[0].get("text", "")
-                
-                # Parse output
-                perception_data = self._parse_sensevoice_output(raw_text)
-                
-                # Logic: Trigger callback if there is text OR if there is a significant event (not None)
-                has_text = bool(perception_data["text"])
-                has_event = perception_data["event"] is not None
-                
-                if has_text or has_event:
-                    console.log(f"[bold blue]Heard:[/bold blue] '{perception_data['text']}'")
-                    console.log(f"[dim]Emotion: {perception_data['emotion']} | Event: {perception_data['event']} | Lang: {perception_data['lang']}[/dim]")
-                    
-                    if self.callback:
-                        self.callback(perception_data)
-                else:
-                    console.log("[dim]No meaningful content detected.[/dim]")
-            else:
-                console.log("[dim]No text recognized.[/dim]")
+
+            # Debug: Print raw SenseVoice response
+            console.print(f"[dim yellow]SenseVoice Raw Response: {asr_res}[/dim yellow]")
+
+            # Extract SenseVoice Raw Text
+            raw_sensevoice = ""
+            if asr_res and isinstance(asr_res, list) and len(asr_res) > 0:
+                raw_sensevoice = asr_res[0].get("text", "")
+
+            # Debug: Print extracted raw text
+            console.print(f"[dim yellow]Extracted Raw Text: '{raw_sensevoice}'[/dim yellow]")
+
+            # Parse and callback
+            self._parse_and_callback(raw_sensevoice)
 
         except Exception as e:
-            console.print(f"[red]Transcription error:[/red] {e}")
+            console.print(f"[red]Speech Processing Error:[/red] {e}")
 
-    def _parse_sensevoice_output(self, raw_text):
+    def _parse_and_callback(self, raw_sensevoice):
         """
-        Parse SenseVoice output to extract text, emotion, and events.
-        Dynamic parsing: Treat unknown tags as emotions unless they are known events.
+        Parse SenseVoice output and trigger callback.
         """
-        if not raw_text:
-            return {
-                "text": "",
-                "emotion": "NEUTRAL",
-                "event": None,
-                "lang": "zh"
-            }
+        # 1. Parse SenseVoice Tags
+        sv_tags = re.findall(r'<\|([A-Za-z0-9]+)\|>', raw_sensevoice)
+        clean_text = re.sub(r'<\|.*?\|>', '', raw_sensevoice).strip()
 
-        # 1. Extract tags using generalized regex
-        # Captures content inside <|...|>
-        tags = re.findall(r'<\|([A-Za-z0-9]+)\|>', raw_text)
-        
-        # 2. Extract clean text (remove all tags)
-        clean_text = re.sub(r'<\|.*?\|>', '', raw_text).strip()
-        
-        # 3. Initialize perception data
-        perception_data = {
-            "text": clean_text,
-            "emotion": "NEUTRAL",
-            "event": None,
-            "lang": "zh"
-        }
-        
-        # 4. Analyze tags
-        # Define known events set
+        emotion = "NEUTRAL"
+        event = None
+        detected_lang = "zh" # Default to zh
+
+        # Known definitions
         known_events = {
-            "Laughter", "Speech", "Music", "Applause", 
+            "Laughter", "Speech", "Music", "Applause",
             "Cry", "Sneeze", "Breath", "Cough"
         }
-        
-        # Define known language codes (to avoid treating them as emotions)
-        known_langs = {"zh", "en", "ja", "ko", "yue"}
-
-        # Define tags to ignore (technical tags)
+        known_langs = {"zh", "en"} # Restrict to zh and en
         ignored_tags = {"withitn", "woitn"}
-        
-        for tag in tags:
-            # Check for language first
+
+        for tag in sv_tags:
             if tag in known_langs:
-                perception_data["lang"] = tag
+                detected_lang = tag
                 continue
 
-            # Check for ignored tags
-            if tag in ignored_tags:
+            # Check for ignored tags or other languages
+            if tag in ignored_tags or tag in ["ja", "ko", "yue"]:
                 continue
-                
-            # Check if it is a known event
-            # SenseVoice event tags are typically CamelCase or specific strings
+
             if tag in known_events:
-                perception_data["event"] = tag
-            else:
-                # If not an event and not a language, treat as Emotion
-                # This allows dynamic open-ended emotions (e.g., SURPRISE, EXCITED)
-                # Avoid overwriting with lower-priority tags if multiple present? 
-                # For now, last tag wins or we can prioritize non-NEUTRAL
-                if tag != "NEUTRAL": 
-                     perception_data["emotion"] = tag
-                elif perception_data["emotion"] == "NEUTRAL":
-                     # Only set NEUTRAL if we haven't found a stronger emotion yet
-                     perception_data["emotion"] = tag
-                
-        return perception_data
+                event = tag
+            elif tag != "NEUTRAL":
+                emotion = tag # SenseVoice emotion
+
+        # 2. Construct Result
+        perception_data = {
+            "text": clean_text,
+            "emotion": emotion,
+            "event": event,
+            "raw": raw_sensevoice,
+            "lang": detected_lang
+        }
+
+        # 3. Output & Callback
+        has_text = bool(clean_text)
+        has_event = event is not None
+
+        if has_text or has_event:
+            # Rich logging
+            console.print(f"[bold blue]Heard:[/bold blue] '{clean_text}'")
+            console.print(f"[dim]Emotion: {emotion} | Event: {event} | Lang: {detected_lang}[/dim]")
+
+            if self.callback:
+                self.callback(perception_data)
+        else:
+            console.log("[dim]No meaningful content detected.[/dim]")
 
     def _unload_local_model(self):
          pass
