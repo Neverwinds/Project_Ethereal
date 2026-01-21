@@ -6,5 +6,4 @@ funasr
 modelscope
 torch
 torchaudio
-transformers
 numpy

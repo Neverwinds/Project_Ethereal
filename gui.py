@@ -65,7 +65,9 @@ class EtherealApp(ctk.CTk):
         self.brain_status = ctk.CTkLabel(self.status_card, text="● Brain: Init...", text_color="gray", font=("Consolas", 12), anchor="w")
         self.brain_status.pack(fill="x", padx=15, pady=(10, 5))
         self.mouth_status = ctk.CTkLabel(self.status_card, text="● Mouth: Init...", text_color="gray", font=("Consolas", 12), anchor="w")
-        self.mouth_status.pack(fill="x", padx=15, pady=(0, 10))
+        self.mouth_status.pack(fill="x", padx=15, pady=(0, 5))
+        self.ears_status = ctk.CTkLabel(self.status_card, text="● Ears: Init...", text_color="gray", font=("Consolas", 12), anchor="w")
+        self.ears_status.pack(fill="x", padx=15, pady=(0, 10))
 
         # 3. 实时元数据 (Live Metadata) - 常驻显示
         self.meta_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
@@ -106,6 +108,11 @@ class EtherealApp(ctk.CTk):
         
         self.btn_conf = ctk.CTkButton(self.nav_frame, text="SETTINGS / CONFIG", fg_color="#3f3f46", hover_color="#27272a", height=45, font=("Segoe UI", 12, "bold"), command=self.show_settings_view)
         self.btn_conf.pack(fill="x", pady=5)
+        
+        # Audio Switch
+        self.switch_audio = ctk.CTkSwitch(self.nav_frame, text="Audio Input", command=self.toggle_audio_input, font=("Segoe UI", 12))
+        self.switch_audio.pack(fill="x", pady=(15, 5), padx=5)
+        self.switch_audio.select()
         
         ctk.CTkFrame(self.nav_frame, height=1, fg_color="#27272a").pack(fill="x", pady=15)
         
@@ -165,6 +172,11 @@ class EtherealApp(ctk.CTk):
         self.log_box = ctk.CTkTextbox(self.debug_frame, font=("Consolas", 11), text_color="#a1a1aa", fg_color="#27272a", wrap="word")
         self.log_box.grid(row=3, column=0, sticky="nsew", padx=15, pady=(0, 15))
         self.log_box.configure(state="disabled")
+
+        ctk.CTkLabel(self.debug_frame, text="STT LIVE FEED", font=("Consolas", 11, "bold"), text_color="#52525b", anchor="w").grid(row=4, column=0, sticky="ew", padx=15, pady=(5, 5))
+        self.stt_box = ctk.CTkTextbox(self.debug_frame, font=("Consolas", 11), text_color="#22d3ee", fg_color="#27272a", wrap="word", height=100)
+        self.stt_box.grid(row=5, column=0, sticky="nsew", padx=15, pady=(0, 15))
+        self.stt_box.configure(state="disabled")
 
         # --- View 2: Settings View (Full Width) ---
         self.view_settings = ctk.CTkFrame(self.content_container, fg_color="transparent")
@@ -375,21 +387,92 @@ class EtherealApp(ctk.CTk):
     # --- Core Logic ---
     def start_async_loading(self): threading.Thread(target=self._load_bot_core, daemon=True).start()
     def _load_bot_core(self):
-        self.bot = EtherealBot()
+        # Initialize Bot with UI Callback
+        self.bot = EtherealBot(ui_callback=self.handle_audio_input, response_callback=self.handle_ai_response)
+        
         self.is_ready = True
         self.after(0, self.load_settings_to_ui)
         bn = self.bot.brain_type.title()
         self.brain_status.configure(text=f"● Brain: {bn}", text_color="#4ade80")
         self.update_mouth_status()
+        self.update_ears_status() # New
         self.activity_label.configure(text="[IDLE]", text_color="#60a5fa")
         self.emotion_label.configure(text="[NEUTRAL]")
         self.entry.configure(state="normal", placeholder_text="Send a message...")
         self.send_btn.configure(state="normal")
         self.add_message("Ethereal", "Link Established.", False)
 
+    def toggle_audio_input(self):
+        """Toggle STT listening state."""
+        if not self.bot: return
+        is_on = bool(self.switch_audio.get())
+        self.bot.set_audio_input_enabled(is_on)
+        self.update_ears_status()
+
     def update_mouth_status(self):
         if self.bot and self.bot.voice_enabled: self.mouth_status.configure(text="● Mouth: Online", text_color="#4ade80")
         else: self.mouth_status.configure(text="○ Mouth: Offline", text_color="#facc15")
+
+    def update_ears_status(self):
+        """Update Ears status label based on switch."""
+        if self.bot: 
+            # In a real scenario we might check bot.ears.is_listening_active, 
+            # but relying on switch state is enough for UI feedback here.
+            is_on = bool(self.switch_audio.get())
+            if is_on:
+                self.ears_status.configure(text="● Ears: Listening", text_color="#4ade80")
+            else:
+                self.ears_status.configure(text="○ Ears: Muted", text_color="gray")
+        else:
+            self.ears_status.configure(text="○ Ears: Offline", text_color="gray")
+
+    def handle_audio_input(self, display_text, full_data, prompt_text):
+        """
+        Callback from Agent's STT thread.
+        Use self.after to schedule UI updates on the main thread.
+        """
+        # 1. Update Chat UI
+        self.after(0, self.add_message, "You (Voice)", display_text, True)
+        
+        # 2. Update Debug Feed
+        timestamp = time.strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] <{full_data.get('emotion', 'NEUTRAL')}> {full_data.get('text', '')}"
+        if full_data.get('event'):
+            log_entry += f" (Event: {full_data['event']})"
+        
+        self.after(0, self.append_stt_log, log_entry)
+        
+        # 3. Trigger AI Response (if not already processing)
+        # We launch a thread to process response so we don't block
+        # [MODIFIED] If prompt_text is None, it means Agent is handling the thinking process
+        # This is the new architecture to support locking in Agent.
+        if prompt_text:
+            threading.Thread(target=self.process_ai_response, args=(prompt_text,), daemon=True).start()
+
+    def handle_ai_response(self, data, stage="thinking_done", m_time=0):
+        """
+        Callback to handle updates from Agent's thread.
+        stages: thinking_started, thinking_done, speaking_done, error
+        """
+        if stage == "thinking_started":
+            self.after(0, lambda: self.activity_label.configure(text="[THINKING]", text_color="#c084fc"))
+            
+        elif stage == "thinking_done":
+            if data:
+                self.after(0, self.add_message, "Ethereal", data["text"], False)
+                self.after(0, self.update_emotion_display)
+                self.after(0, self.append_raw_log, data["raw"])
+                self.after(0, self.update_debug_panels, data.get("payload"), data["duration"], 0)
+                self.after(0, lambda: self.activity_label.configure(text="[SPEAKING]", text_color="#4ade80"))
+            
+        elif stage == "speaking_done":
+            if data:
+                self.after(0, self.update_debug_panels, data.get("payload"), data["duration"], m_time)
+            self.after(0, lambda: self.activity_label.configure(text="[IDLE]", text_color="#60a5fa"))
+            
+        elif stage == "error":
+            self.after(0, self.add_message, "System", "Link Lost (Agent Error).", False)
+            self.after(0, lambda: self.activity_label.configure(text="[IDLE]", text_color="#60a5fa"))
 
     def update_debug_panels(self, payload, b_time, m_time):
         self.payload_box.configure(state="normal")
@@ -465,6 +548,13 @@ class EtherealApp(ctk.CTk):
         self.log_box.insert("end", f"> {text}\n\n")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
+
+    def append_stt_log(self, text):
+        # Helper for STT logs
+        self.stt_box.configure(state="normal")
+        self.stt_box.insert("end", f"{text}\n")
+        self.stt_box.see("end")
+        self.stt_box.configure(state="disabled")
 
 if __name__ == "__main__":
     app = EtherealApp()
